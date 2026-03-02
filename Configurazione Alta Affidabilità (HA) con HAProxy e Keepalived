@@ -1,0 +1,131 @@
+Configurazione Alta Affidabilità (HA) con HAProxy e Keepalived
+Questa guida spiega come configurare un Virtual IP (VIP) utilizzando Keepalived e un bilanciatore di carico HAProxy per esporre l'API Server di un cluster Kubernetes (o MicroK8s) in modo resiliente.
+
+Step 1: Installazione (Su ENTRAMBI i nodi)
+
+Per prima cosa, aggiorniamo i repository e installiamo i pacchetti necessari su entrambi i nodi del bilanciatore.
+
+sudo apt update && sudo apt install -y haproxy keepalived
+
+Abilitare il binding di IP non locali
+Dobbiamo permettere ad HAProxy di mettersi in ascolto sull'indirizzo IP Virtuale (VIP) anche se non è ancora assegnato fisicamente alla scheda di rete:
+echo "net.ipv4.ip_nonlocal_bind=1" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+
+Step 2: Configurazione di Keepalived
+Keepalived gestisce il "passaggio" dell'IP tra i due nodi. Se il Master fallisce, il Backup prende il suo posto.
+
+Nodo MASTER (HA-PROXY01)
+
+Modifica il file /etc/keepalived/keepalived.conf:
+
+vrrp_script check_haproxy {
+    # Verifica se HAProxy è attivo tramite l'endpoint di salute locale
+    script "/usr/bin/curl -f -s --max-time 3 http://127.0.0.1:10242/healthz"
+    interval 3          # Esegui il check ogni 3 secondi
+    rise 2              # 2 check positivi = UP
+    fall 3              # 3 check negativi = DOWN
+    weight 2            # Aumenta la priorità se il check passa
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface ens33     # <--- Verifica il nome della tua interfaccia (es. eth0, ens18)
+    virtual_router_id 51
+    priority 101        # Priorità più alta per il Master
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass HA-PROXY-2026
+    }
+    virtual_ipaddress {
+        192.168.73.10/24  # Il tuo IP Virtuale (VIP)
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+Nodo BACKUP (HA-PROXY02)
+Modifica /etc/keepalived/keepalived.conf cambiando solo state e priority:
+vrrp_instance VI_1 {
+    state BACKUP        # Impostato come Backup
+    priority 100        # Priorità più bassa del Master
+    # ... resto della configurazione identico al Master ...
+}
+
+
+Step 3: Configurazione di HAProxy
+HAProxy riceve il traffico sul VIP e lo smista ai nodi Master di Kubernetes.
+Configura /etc/haproxy/haproxy.cfg su entrambi i nodi:
+global
+    log /dev/log local0 warning
+    chroot /var/lib/haproxy
+    maxconn 4000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+
+# Check interno per Keepalived
+frontend health_check
+    bind 127.0.0.1:10242
+    mode http
+    monitor-uri /healthz
+
+# Bilanciamento API Server Kubernetes
+frontend k8s-api
+    bind 192.168.73.10:6443        # Ascolta sul VIP porta 6443
+    mode tcp
+    default_backend kube-apiserver
+
+backend kube-apiserver
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    # Inserisci gli IP reali dei tuoi nodi Master K8s
+    server k8s-m01 192.168.73.21:6443 check
+    server k8s-m02 192.168.73.22:6443 check
+    server k8s-m03 192.168.73.23:6443 check
+
+
+Step 4: Gestione Servizi e Firewall
+Riavvia i servizi per applicare le modifiche:
+sudo systemctl restart haproxy 
+sudo systemctl restart keepalived
+
+Configurazione Firewall (Critico)
+Keepalived usa il protocollo VRRP. Dobbiamo permetterlo esplicitamente:
+# Se usi UFW
+sudo ufw allow proto vrrp
+sudo ufw allow 6443/tcp
+
+# Se UFW dà problemi, usa direttamente iptables:
+sudo iptables -I INPUT -p 112 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 6443 -j ACCEPT
+sudo apt install -y iptables-persistent && sudo netfilter-persistent save
+
+
+Step 5: Verifica del Funzionamento
+Verifica il VIP: Sul nodo MASTER, l'IP dovrebbe apparire:
+ip addr show | grep 192.168.73.10
+
+Test Failover: Spegni Keepalived sul Master e controlla se l'IP "salta" sul Backup:
+# Sul MASTER
+sudo systemctl stop keepalived
+# Sul BACKUP
+ip addr show | grep 192.168.73.10
+
+Test API: Prova a contattare il cluster tramite il VIP:
+curl -k https://192.168.73.10:6443/healthz
+# Risultato atteso: "Unauthorized" (401) = Il server risponde correttamente.
+
+
